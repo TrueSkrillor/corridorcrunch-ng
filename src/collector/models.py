@@ -1,127 +1,71 @@
 from django.db import models
-
+from hashlib import sha256
 
 class PuzzlePiece(models.Model):
-	url = models.URLField(verbose_name="image url")
-	hash = models.CharField(max_length=64, unique=True, default="empty", verbose_name="sha256 hash of the url")
-	ip_address = models.CharField(max_length=64, default="?.?.?.?", verbose_name="hash of submitter ip address")
-	submitted_date = models.DateTimeField(verbose_name="submitted date", auto_now_add=True)
-	last_modified = models.DateTimeField(verbose_name="last modified date", auto_now=True)
-	approved = models.NullBooleanField(verbose_name="is image approved for verification")
-	priority = models.PositiveIntegerField(default=0,verbose_name="Priority value in transcription queue")
-	transCount = models.PositiveIntegerField(default=0,verbose_name="Number of transcriptions received for this image")
+	url = models.URLField(verbose_name="Image url")
+	hash = models.CharField(max_length=64, unique=True, verbose_name="SHA256 hash of the url", default=None, null=True, blank=True)
+	submitter = models.CharField(max_length=64, verbose_name="Hash of submitter ip address", default="", blank=True)
+	submission_date = models.DateTimeField(verbose_name="Submission date", auto_now_add=True)
+	priority = models.PositiveIntegerField(verbose_name="Priority value in transcription queue", default=0)
+	confidence = models.PositiveIntegerField(verbose_name="Confidence score", default=0, blank=True)
 
-	def __str__(self):
-		data = []
-		data.append("URL: {}".format(self.url))
-		data.append("ip_address: {}".format(self.ip_address))
-		data.append("submitted_date: {}".format(self.submitted_date))
-		data.append("last_modified: {}".format(self.last_modified))
-		data.append("hash: {}".format(self.hash))
-		data.append("transCount: {}".format(self.transCount))
+	def save(self, *args, **kwargs):
+		self.hash = self.calculate_hash()
+		super().save(*args, **kwargs)
 
-		result = ""
-		for d in data:
-			result += "<li>{}</li>".format(d)
-		result = "<ul>" + result + "</ul>"
-		return result
+	def calculate_hash(self):
+		return sha256(str(self.url).encode('utf-8')).hexdigest()
 
-
-class TranscriptionData(models.Model):
+class Transcription(models.Model):
 	class Meta:
 		indexes = [
 			models.Index(fields=['ip_address'], name='ip_address_idx')
 		]
-	
-	puzzlePiece = models.ForeignKey(PuzzlePiece, on_delete=models.CASCADE, related_name="transcriptions")
-	ip_address = models.CharField(max_length=64, default="?.?.?.?", verbose_name="hash of submitter ip address")
-	submitted_date = models.DateTimeField(verbose_name="submitted date", auto_now=True)
 
-	bad_image = models.BooleanField(verbose_name="image is bad or hard to read")
-	orientation = models.CharField(max_length=10, default="", verbose_name="orientation direction from image")
-	rawdata = models.TextField(default="", verbose_name="Raw JSON taken in for later debugging.")
-	datahash = models.CharField(max_length=64, default="", verbose_name="sha256 hash for easier comparisons")
+	# Metadata
+	puzzle_piece = models.ForeignKey(PuzzlePiece, on_delete=models.CASCADE, related_name="transcriptions", null=True, default=None)
+	submitter = models.CharField(max_length=64, verbose_name="Hash of submitter ip address", default="", blank=True)
+	submission_date = models.DateTimeField(verbose_name="Submission date", auto_now_add=True)
+	# Flags
+	bad_flag = models.BooleanField(verbose_name="Image is bad or hard to read", default=False)
+	rotation_flag = models.BooleanField(verbose_name="Image is rotated", default="")
+	# Center in short notation
+	center = models.CharField(max_length=1, verbose_name="center", default="")
+	# Walls
+	wall1 = models.BooleanField(verbose_name="Wall 1 (top)", default=False)
+	wall2 = models.BooleanField(verbose_name="Wall 2 (top-right)", default=False)
+	wall3 = models.BooleanField(verbose_name="Wall 3 (bottom-right)", default=False)
+	wall4 = models.BooleanField(verbose_name="Wall 4 (bottom)", default=False)
+	wall5 = models.BooleanField(verbose_name="Wall 5 (bottom-left)", default=False)
+	wall6 = models.BooleanField(verbose_name="Wall 6 (top-left)", default=False)
+	# Links
+	link1 = models.CharField(max_length=7, verbose_name="Link 1 (top)", default="")
+	link2 = models.CharField(max_length=7, verbose_name="Link 2 (top-right)", default="")
+	link3 = models.CharField(max_length=7, verbose_name="Link 3 (bottom-right)", default="")
+	link4 = models.CharField(max_length=7, verbose_name="Link 4 (bottom)", default="")
+	link5 = models.CharField(max_length=7, verbose_name="Link 5 (bottom-left)", default="")
+	link6 = models.CharField(max_length=7, verbose_name="Link 6 (top-left)", default="")
+	# SHA256 hash of 'center wallsAsBitstring link1 link2 link3 link4 link5 link6' for comparison
+	hash = models.CharField(max_length=64, verbose_name="SHA256 hash for comparison", default="", null=True, blank=True)
 
-	center = models.CharField(max_length=20, verbose_name="center")
+	def save(self, *args, **kwargs):
+		self.sanitize_fields()
+		if self.bad_flag:
+			self.hash = None
+		else:
+			self.hash = self.calculate_hash()
+		super().save(*args, **kwargs)
 
-	wall1 = models.BooleanField(verbose_name="wall 1 (top)")
-	wall2 = models.BooleanField(verbose_name="wall 2 (top-right)")
-	wall3 = models.BooleanField(verbose_name="wall 3 (bottom-right)")
-	wall4 = models.BooleanField(verbose_name="wall 4 (bottom)")
-	wall5 = models.BooleanField(verbose_name="wall 5 (bottom-left)")
-	wall6 = models.BooleanField(verbose_name="wall 6 (top-left)")
+	def calculate_hash(self):
+		hashInput = (
+			f"{self.center} "
+			f"{str(int(self.wall1))}{str(int(self.wall2))}{str(int(self.wall3))}"
+			f"{str(int(self.wall4))}{str(int(self.wall5))}{str(int(self.wall6))} "
+			f"{self.link1} {self.link2} {self.link3} {self.link4} {self.link5} {self.link6}"
+		).encode("utf-8")
+		return sha256(hashInput).hexdigest()
 
-	link1 = models.CharField(max_length=7, verbose_name="link 1 (top)")
-	link2 = models.CharField(max_length=7, verbose_name="link 2 (top-right)")
-	link3 = models.CharField(max_length=7, verbose_name="link 3 (bottom-right)")
-	link4 = models.CharField(max_length=7, verbose_name="link 4 (bottom)")
-	link5 = models.CharField(max_length=7, verbose_name="link 5 (bottom-left)")
-	link6 = models.CharField(max_length=7, verbose_name="link 6 (top-left)")
-
-	def __str__(self):
-		return "{} {} {}".format(self.center, self.wall1, self.link1)
-
-
-class BadImage(models.Model):
-	puzzlePiece = models.ForeignKey(PuzzlePiece, on_delete=models.CASCADE, related_name="badimages")
-	last_modified = models.DateTimeField(verbose_name="last modified date", auto_now=True)
-	badCount = models.PositiveIntegerField(default=0,verbose_name="how often this image was reported as bad")
-
-	class Meta:
-		unique_together = ('id', 'puzzlePiece',)
-
-class RotatedImage(models.Model):
-	puzzlePiece = models.ForeignKey(PuzzlePiece, on_delete=models.CASCADE, related_name="rotatedimages")
-	last_modified = models.DateTimeField(verbose_name="last modified date", auto_now=True)
-	rotatedCount = models.PositiveIntegerField(default=0,verbose_name="how often this image was reported as incorrectly rotated")
-
-	class Meta:
-		unique_together = ('id', 'puzzlePiece',)
-
-class ConfidenceTracking(models.Model):
-	puzzlePiece = models.ForeignKey(PuzzlePiece, on_delete=models.CASCADE, related_name="confidences")
-	last_modified = models.DateTimeField(verbose_name="last modified date", auto_now=True)
-	confidence = models.PositiveIntegerField(default=0,verbose_name="how confident are we in this image, 0 to 100")
-
-	class Meta:
-		unique_together = ('id', 'puzzlePiece',)
-
-
-class ConfidentSolution(models.Model):
-	puzzlePiece = models.ForeignKey(PuzzlePiece, on_delete=models.CASCADE, related_name="confidentsolutions")
-	last_modified = models.DateTimeField(verbose_name="last modified date", auto_now=True)
-	confidence = models.PositiveIntegerField(default=0,verbose_name="how confident are we in this image, 0 to 100")
-	datahash = models.CharField(max_length=64, default="", verbose_name="sha256 hash for easier comparisons")
-
-	center = models.CharField(max_length=20, verbose_name="center")
-
-	wall1 = models.BooleanField(verbose_name="wall 1 (top)")
-	wall2 = models.BooleanField(verbose_name="wall 2 (top-right)")
-	wall3 = models.BooleanField(verbose_name="wall 3 (bottom-right)")
-	wall4 = models.BooleanField(verbose_name="wall 4 (bottom)")
-	wall5 = models.BooleanField(verbose_name="wall 5 (bottom-left)")
-	wall6 = models.BooleanField(verbose_name="wall 6 (top-left)")
-
-	link1 = models.CharField(max_length=7, verbose_name="link 1 (top)")
-	link2 = models.CharField(max_length=7, verbose_name="link 2 (top-right)")
-	link3 = models.CharField(max_length=7, verbose_name="link 3 (bottom-right)")
-	link4 = models.CharField(max_length=7, verbose_name="link 4 (bottom)")
-	link5 = models.CharField(max_length=7, verbose_name="link 5 (bottom-left)")
-	link6 = models.CharField(max_length=7, verbose_name="link 6 (top-left)")
-
-	def copyFromTranscription(self, transcription):
-		self.puzzlePiece = transcription.puzzlePiece
-		self.center = transcription.center
-		self.wall1 = transcription.wall1
-		self.wall2 = transcription.wall2
-		self.wall3 = transcription.wall3
-		self.wall4 = transcription.wall4
-		self.wall5 = transcription.wall5
-		self.wall6 = transcription.wall6
-
-		self.link1 = transcription.link1
-		self.link2 = transcription.link2
-		self.link3 = transcription.link3
-		self.link4 = transcription.link4
-		self.link5 = transcription.link5
-		self.link6 = transcription.link6
+	def sanitize_fields(self):
+		fields = [ "center", "link1", "link2", "link3", "link4", "link5", "link6" ]
+		for field in fields:
+			self.__setattr__(field, self.__getattribute__(field).upper())

@@ -1,3 +1,9 @@
+from urllib.parse import urlparse
+import csv
+import requests
+import re
+import json
+
 from django.http import HttpResponse
 from django.http import Http404
 from django.template import loader
@@ -7,114 +13,78 @@ from django.views.decorators.cache import cache_page
 from django.db.models import Count, F, Max
 from django.utils.decorators import method_decorator
 from django.conf import settings
-from .models import *
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework import mixins, status, viewsets
+
+from .models import PuzzlePiece, Transcription
 from .serializers import (
     PuzzlePieceSerializer,
     TranscriptionDataSerializer,
     BadImageSerializer,
     ConfidentSolutionSerializer,
 )
-import json
-#from django.db import transaction
-from . import UtilityOps as UtilityOps
-from urllib.parse import urlparse
-from random import randint
-import csv
-import hashlib
-import hmac
-import requests
-import re
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from rest_framework import mixins, status, viewsets
+from .utility import *
+
+# Settings for the confidence and image distribution logic
+DEFAULT_PUZZLE_PIECE_PRIORITY = 10
+IMAGE_POOL_SIZE = 100
+CONFIDENCE_RATIO = 80
+MIN_TRANSCRIPTIONS = 3
+MIN_ROTATED_TRANSCRIPTIONS = 5
+BAD_FLAG_THRESHOLD = 2
 
 # Regex pattern for text submissions
-textSubmissionPattern = re.compile(r"^\s*(?P<center>(Blank|Plus|Clover|Hex|Snake|Diamond|Cauldron|B|P|C|H|S|D|T))\s*(?P<sides>([1-6])(\s*,\s*[1-6]){0,5})(?P<links>(\s*[BPCHSDT]{7}){6})\s*$", re.IGNORECASE)
+TEXT_SUBMISSION_PATTERN = re.compile(r"^\s*(?P<center>(Blank|Plus|Clover|Hex|Snake|Diamond|Cauldron|B|P|C|H|S|D|T))\s*(?P<sides>([1-6])(\s*,\s*[1-6]){0,5})(?P<links>(\s*[BPCHSDT]{7}){6})\s*$", re.IGNORECASE)
 
-def hash_my_data(url):
-	url = url.encode("utf-8")
-	hash_object = hashlib.sha256(url)
-	hex_dig = hash_object.hexdigest()
-	return hex_dig
+# Image url patterns used in find_image
+IMAGE_URL_PATTERNS = ({
+	"imgur.com": [ "https://i.imgur.com/{}.png", "https://i.imgur.com/{}.jpg", "https://i.imgur.com/{}.jpeg" ],
+	"gyazo.com": [ "https://i.gyazo.com/{}.png", "https://i.gyazo.com/{}.jpg", "https://i.imgur.com/{}.jpeg" ]
+})
+IMAGE_URL_WHITELIST = ["cdn.discordapp.com", "media.discordapp.net", "i.gyazo.com", "gyazo.com", "i.imgur.com", "imgur.com"]
 
-# When exporting data, we shouldn't really make hash(ip) public because it's
-# too easy to reverse. Use HMAC with SECRET_KEY as a keyed hash, to prevent
-# reversing while still being usable as a unique identifier within a single
-# exported set of data
-def secretly_hash_my_data(data):
-	key = settings.SECRET_KEY.encode("utf-8")
-	data = data.encode("utf-8")
-	hash_object = hmac.new(key, data, hashlib.sha256)
-	hex_dig = hash_object.hexdigest()
-	return hex_dig
+def find_image(url):
+	host = url.hostname
+	if host in IMAGE_URL_PATTERNS.keys():
+		for url_pattern in IMAGE_URL_PATTERNS[host]:
+			target_url = url_pattern.format(url.path)
+			res = requests.head(target_url)
+			if res.status_code == 200:
+				return target_url
+	return None
 
-def findImage(url):
-	host = urlparse(url).hostname
-	if host in ["imgur.com"]:
-	# Can we be clever and figure out an Imgur URL on the fly?
-		turl = "https://i.imgur.com" + urlparse(url).path + ".png"
-		res = requests.head(turl)
-		if res.status_code == 200:
-			return turl
-		turl = "https://i.imgur.com" + urlparse(url).path + ".jpg"
-		res = requests.head(turl)
-		if res.status_code == 200:
-			return turl
-		turl = "https://i.imgur.com" + urlparse(url).path + ".jpeg"
-		res = requests.head(turl)
-		if res.status_code == 200:
-			return turl
-		return None
-	elif host in ["gyazo.com"]:
-		turl = "https://i.gyazo.com" + urlparse(url).path + ".png"
-		res = requests.head(turl)
-		if res.status_code == 200:
-			return turl
-		turl = "https://i.gyazo.com" + urlparse(url).path + ".jpg"
-		res = requests.head(turl)
-		if res.status_code == 200:
-			return turl
-		turl = "https://i.gyazo.com" + urlparse(url).path + ".jpeg"
-		res = requests.head(turl)
-		if res.status_code == 200:
-			return turl
-		return None
-	else:
-		return None
-
-def findUnconfidentPuzzlePieces(self):
+def find_unconfident_puzzle_piece(request):
+	client_identifier = disguise_client_ip(get_client_ip(request))
 	# We want to order by transCount descending to get faster results. We do not show anything definitely flagged as bad; that already has been solved
-	# Allow multiple transcriptions by one person - at the current load the database query is just to expensive
-	result = PuzzlePiece.objects.raw("""
+	result = PuzzlePiece.objects.raw(f"""
 		SELECT * FROM
-			(SELECT * FROM collector_puzzlepiece WHERE
-				id NOT IN (SELECT puzzlePiece_id FROM collector_confidentsolution) AND
-				id NOT IN (SELECT puzzlePiece_id FROM collector_badimage)
-				ORDER BY priority DESC, transCount DESC
-				LIMIT 100
-			) AS current_transcriptions
+			(SELECT * FROM collector_puzzlepiece pp WHERE
+				confidence < {CONFIDENCE_RATIO} AND
+				(SELECT SUM(t.bad_flag) FROM collector_transcription t WHERE t.puzzle_piece_id = pp.id) < {BAD_FLAG_THRESHOLD} AND
+				NOT EXISTS (SELECT t.id FROM collector_transcription t WHERE t.puzzle_piece_id = t.id AND t.submitter = {client_identifier})
+				ORDER BY pp.priority DESC
+				LIMIT {IMAGE_POOL_SIZE}
+			) ct
 		ORDER BY RAND()
 		LIMIT 1
 	""")
-	# Want less than a certain confidence.
-	# X or more "bad image" records will disqualify from showing up again.
 
-	if len(result) > 0:
-		# Add an isImage that we'll reference in the template, this allows us to handle generic links
-		parsedUrl = urlparse(result[0].url)
-		if parsedUrl.path.lower().endswith(".jpg") or parsedUrl.path.lower().endswith(".png") or parsedUrl.path.lower().endswith(".jpeg"):
-			result[0].isImage = True
-		else:
-			result[0].isImage = False
-		# Warn if rotateod
-		rotated = PuzzlePiece.objects.raw('SELECT id FROM collector_rotatedimage WHERE puzzlePiece_id = ' + str(result[0].id))
-		if rotated:
-			result[0].isRotated = True
-		else:
-			result[0].isRotated = False
-		return result[0]
-	return None
+	if len(result) == 0:
+		return None
+	result = result[0]
 
+	# Add an is_image that we'll reference in the template, this allows us to handle generic links
+	result.is_image = is_image_url(urlparse(result.url))
+
+	# Warn if rotated
+	rotated = PuzzlePiece.objects.raw(f"""
+		SELECT COUNT(id) FROM collector_transcription WHERE
+			puzzle_piece_id = {result.id} AND
+			rotation_flag = 1
+	""")
+	result.is_rotated = rotated > 0
+	return result
 
 @cache_page(60 * 60)
 def index(request):
@@ -126,39 +96,37 @@ def transcriptionGuide(request):
 	template = loader.get_template("collector/transcriptionGuide.html")
 	return HttpResponse(template.render(None, request))
 
-def puzzlepieceSubmit(request):
+def submit_puzzle_piece(request):
 	responseMessage = None
 	responseMessageSuccess = None
-	# New submissions are first in queue, but behind specific streamer requests
-	priority = 10
 
 	try:
 		if request.method == "POST":
 			url = request.POST["url"].strip()
 			if len(url) > 200:
-				raise ValueError('You havin\' a laff, mate? A URL that long? Yeah no.')
-			host = urlparse(url).hostname
-			if host not in ["cdn.discordapp.com", "media.discordapp.net", "i.gyazo.com", "gyazo.com", "i.imgur.com", "imgur.com"]:
-				raise ValueError('We only accept images from cdn.discordapp.com, media.discordapp.net, (i.)gyazo.com and (i.)imgur.com right now.')
-			if host not in ["gyazo.com", "imgur.com"] and not (url.lower().endswith(".jpg") or url.lower().endswith(".png") or url.lower().endswith(".jpeg")):
-				raise ValueError('Please make sure your link ends with .jpg or .jpeg or .png. Direct links to images work best with our current site.')
-			if host in ["gyazo.com", "imgur.com"]:
-				turl = findImage(url)
-				if turl:
-					url = turl
-			if url.find("http",8,len(url)) != -1:
-				raise ValueError('Found http in the middle of the URL - did you paste it twice?' + url)
+				raise ValueError("You havin\' a laff, mate? A URL that long? Yeah no.")
+			parsed_url = urlparse(url)
+			if parsed_url.hostname not in IMAGE_URL_WHITELIST:
+				raise ValueError(f"We only accept images from {', '.join(IMAGE_URL_WHITELIST)} right now.")
+			# Try to convert to an image url if not already present
+			if not is_image_url(parsed_url):
+				target_url = find_image(parsed_url)
+				if target_url:
+					url = target_url
+				else:
+					raise ValueError('Please make sure your link ends with .jpg or .jpeg or .png. Direct links to images work best with our current site.')
+			# Check if image is reachable
 			res = requests.head(url)
 			if res.status_code != 200:
 				raise ValueError(url + ' -- That URL does not seem to exist. Please verify and try again.')
 
-			newPiece = PuzzlePiece()
-			newPiece.url = url
-			newPiece.hash = hash_my_data(url)
+			new_piece = PuzzlePiece()
+			new_piece.url = url
 			# An IP is personal data as per GDPR, kid you not. Let's hash it, we just need something unique
-			newPiece.ip_address = hash_my_data(UtilityOps.UtilityOps.GetClientIP(request))
-			newPiece.priority = priority
-			newPiece.save()
+			new_piece.submitter = disguise_client_ip(get_client_ip(request))
+			new_piece.priority = DEFAULT_PUZZLE_PIECE_PRIORITY
+			new_piece.save()
+
 			responseMessageSuccess = "Puzzle Piece image submitted successfully!"
 	except KeyError as ex:
 		responseMessage = "There was an issue with your request. Please try again?"
@@ -177,178 +145,109 @@ def puzzlepieceSubmit(request):
 	}
 	return HttpResponse(template.render(context, request))
 
-@method_decorator(cache_page(5 * 60), name='dispatch')
-class PuzzlepieceIndex(generic.ListView):
+@method_decorator(cache_page(60), name='dispatch')
+class PuzzlePieceIndex(generic.ListView):
 	template_name = 'collector/latest.html'
 	context_object_name = 'latest'
 
 	def get_queryset(self):
 		return PuzzlePiece.objects.order_by("-submitted_date")[:50]
 
-
-def puzzlepieceView(request, image_id):
+def puzzle_piece_view(request, image_id):
 	piece = get_object_or_404(PuzzlePiece, pk=image_id)
-	if len(piece.hash) == 0 or "empty" == str(piece.hash).lower():
-		piece.hash = hash_my_data(piece.url)
-		piece.save()
-
-	#transcriptions = TranscriptionData.objects.filter(puzzlePiece_id=image_id)
-
 	context = {
-		"puzzlepiece": piece,
-
+		"puzzlepiece": piece
 	}
-	#"transcriptions": transcriptions
 	return render(request, 'collector/puzzlepieceDetail.html', context)
-
 
 class TranscribeIndex(generic.ListView):
 	template_name = 'collector/transcribe.html'
 	context_object_name = 'puzzlepiece'
 
 	def get_queryset(self):
-		return findUnconfidentPuzzlePieces(self)
+		return find_unconfident_puzzle_piece(self.request)
 
-
-def processTranscription(request, puzzlepiece_id):
+def process_transcription(request, puzzlepiece_id):
 	data = None
 	errors = None
-	transcriptData = None
+	transcript_data = None
 
 	if request.method == "POST":
-		if "bad_image" in request.POST:
-			bad_image = request.POST["bad_image"]
-		else:
-			bad_image = False
-		if "rotated_image" in request.POST:
-			rotated_image = request.POST["rotated_image"]
-		else:
-			rotated_image = False
+		is_bad_image = request.POST["bad_image"] if "bad_image" in request.POST else False
+		is_rotated_image = request.POST["rotated_image"] if "rotated_image" in request.POST else False
 		data = request.POST["data"]
 		try:
 			data = json.loads(data)
 		except Exception:
-			match = textSubmissionPattern.match(data)
-			if match:
-				data = parse_data_string(match)
-			else:
-				data = None
+			# If parsing the data fails we know that the data might be provided as plain text in the known format
+			match = TEXT_SUBMISSION_PATTERN.match(data)
+			data = parse_plain_data(match) if match else None
 
 		puzzlePiece = get_object_or_404(PuzzlePiece, pk=puzzlepiece_id)
 		# Hash IP bcs of GDPR
-		client_ip_address = hash_my_data(UtilityOps.UtilityOps.GetClientIP(request))
-		errors, transcriptData = processTransscriptionData(data, bad_image, rotated_image, puzzlePiece, client_ip_address)
+		client_identifier = disguise_client_ip(get_client_ip(request))
+		errors, transcript_data = process_transcription_data(data, is_bad_image, is_rotated_image, puzzlePiece, client_identifier)
 		determineConfidence(puzzlepiece_id)
 
 	context = {
 		"data": data,
 		"errors": errors,
-		"transcript": transcriptData
+		"transcript": transcript_data
 	}
 	return render(request, "collector/transcribeResults.html", context=context)
 
-
-
-def parse_data_string(matchedData):
+def parse_plain_data(matched_data):
     data_dict = {}
 
     # Sometimes the center is fully written out. Other times it is not.
     # This allows for both.
-    data_dict["center"] = "T" if matchedData.group('center') == "Cauldron" else matchedData.group('center').upper()[0]
+    data_dict["center"] = "T" if matched_data.group('center') == "Cauldron" else matched_data.group('center').upper()[0]
 
     # Wall list of length 6. Default is wall true, since string contains list of
     # openings.
     data_dict["walls"] = [True] * 6
-    for opening in matchedData.group('sides').split(","):
+    for opening in matched_data.group('sides').split(","):
         data_dict["walls"][int(opening) - 1] = False
 
     # Node list. Split string into list of strings, then split each side
     # into a list of characters.
     data_dict["nodes"] = []
-    side_list = matchedData.group('links').split()
+    side_list = matched_data.group('links').split()
     for side in side_list:
         data_dict["nodes"].append(list(side.upper()))
 
     return data_dict
 
-
-
-def processTransscriptionData(rawData, bad_image, rotated_image, puzzlePiece, client_ip_address):
-	if bad_image and bool(bad_image) == True:
-		transcriptData = TranscriptionData()
-		transcriptData.ip_address = client_ip_address
-		transcriptData.puzzlePiece = puzzlePiece
-		transcriptData.bad_image = True
-		transcriptData.datahash = "badimage"
-
-		transcriptData.center = ""
-		transcriptData.wall1 = False
-		transcriptData.wall2 = False
-		transcriptData.wall3 = False
-		transcriptData.wall4 = False
-		transcriptData.wall5 = False
-		transcriptData.wall6 = False
-		transcriptData.link1 = ""
-		transcriptData.link2 = ""
-		transcriptData.link3 = ""
-		transcriptData.link4 = ""
-		transcriptData.link5 = ""
-		transcriptData.link6 = ""
-		if rotated_image and bool(rotated_image) == True:
-			transcriptData.orientation = "wrong"
-
-		transcriptData.save()
-		return [], transcriptData
-
-	center = UtilityOps.UtilityOps.GetDictValues(rawData, "center", None)
-	walls = UtilityOps.UtilityOps.GetDictValues(rawData, "walls", None)
-	edges = UtilityOps.UtilityOps.GetDictValues(rawData, "nodes", None)
-
+def process_transcription_data(raw_transcription, is_bad, is_rotated, puzzle_piece, client_identifier):
+	transcriptData = Transcription()
+	transcriptData.submitter = client_identifier
+	transcriptData.puzzle_piece = puzzle_piece
+	transcriptData.bad_flag = is_bad
+	transcriptData.rotation_flag = is_rotated
 	errors = []
-	if not center:
-		errors.append("No center value was found in the JSON. This is required.")
-	if walls and len(walls) != 6:
-		errors.append("There should be 6 walls in the JSON. {} were found.".format(len(walls)))
-	if edges and len(edges) != 6:
-		errors.append("There should be 6 edges/nodes in the JSON. {} were found.".format(len(edges)))
 
-	transcriptData = None
-	if len(errors) == 0:
-		# Prepare the Transcription Data
-		transcriptData = TranscriptionData()
-		transcriptData.bad_image = False
-		transcriptData.ip_address = client_ip_address
-		transcriptData.puzzlePiece = puzzlePiece
+	# If the image is marked as bad we can skip parsing the transcription and stick to the default values
+	if not transcriptData.bad_flag:
+		# Parse data from raw_transcription
+		center = get_dict_value(raw_transcription, "center", None)
+		walls = get_dict_value(raw_transcription, "walls", None)
+		edges = get_dict_value(raw_transcription, "nodes", None)
+		if not center:
+			errors.append("No center value was found in the JSON. This is required.")
+		if walls and len(walls) != 6:
+			errors.append("There should be 6 walls in the JSON. {} were found.".format(len(walls)))
+		if edges and len(edges) != 6:
+			errors.append("There should be 6 edges/nodes in the JSON. {} were found.".format(len(edges)))
+		# Set parsed data
 		transcriptData.center = center
+		for i in range(6):
+			transcriptData.__setattr__(f"wall{str(i + 1)}", walls[i])
+			transcriptData.__setattr__(f"link{str(i + 1)}", edges[i])
 
-		transcriptData.wall1 = walls[0]
-		transcriptData.wall2 = walls[1]
-		transcriptData.wall3 = walls[2]
-		transcriptData.wall4 = walls[3]
-		transcriptData.wall5 = walls[4]
-		transcriptData.wall6 = walls[5]
-
-		linkJoiner = ""
-		transcriptData.link1 = linkJoiner.join(edges[0])
-		transcriptData.link2 = linkJoiner.join(edges[1])
-		transcriptData.link3 = linkJoiner.join(edges[2])
-		transcriptData.link4 = linkJoiner.join(edges[3])
-		transcriptData.link5 = linkJoiner.join(edges[4])
-		transcriptData.link6 = linkJoiner.join(edges[5])
-
-		hashStr = center + ' ' + str(1 if walls[0] == True else 0) + str(1 if walls[1] == True else 0) + str(1 if walls[3] == True else 0) + \
-			str(1 if walls[4] == True else 0) + str(1 if walls[4] == True else 0) + str(1 if walls[5] == True else 0) + ' ' + \
-			transcriptData.link1 + ' ' + transcriptData.link2 + ' ' + transcriptData.link3 + ' ' + \
-			transcriptData.link4 + ' ' + transcriptData.link5 + ' ' + transcriptData.link6
-
-		transcriptData.datahash = hash_my_data(hashStr.upper())
-		if rotated_image and bool(rotated_image) == True:                                                                                                                                                                                                                           transcriptData.orientation = "wrong"
-
-		transcriptData.save()
-
+	transcriptData.save()
 	return errors, transcriptData
 
-@method_decorator(cache_page(5 * 60), name='dispatch')
+@method_decorator(cache_page(60), name='dispatch')
 class TranscriptionsIndex(generic.ListView):
 	template_name = 'collector/transcriptions.html'
 	context_object_name = 'latest'
@@ -356,264 +255,82 @@ class TranscriptionsIndex(generic.ListView):
 	def get_queryset(self):
 		return TranscriptionData.objects.order_by("-submitted_date")[:50]
 
-
-def transcriptionsDetail(request, transcription_id):
-	transcription = get_object_or_404(TranscriptionData, pk=transcription_id)
-
-	if not transcription.datahash:
-		pass
-
+def transcriptions_detail(request, transcription_id):
+	transcription = get_object_or_404(Transcription, pk=transcription_id)
 	context = {
 		"transcription": transcription,
-		"puzzlepiece": transcription.puzzlePiece
+		"puzzlepiece": transcription.puzzle_piece
 	}
 	return render(request, 'collector/transcriptionDetail.html', context)
 
-
-@method_decorator(cache_page(5 * 60), name='dispatch')
-class ConfidenceIndex(generic.ListView):
-	model = ConfidenceTracking
-	template_name = 'collector/confidenceIndex.html'
-	context_object_name = 'latest'
-
-def confidenceDetail(request, confidence_id):
-	confidence = get_object_or_404(ConfidenceTracking, pk=confidence_id)
-
-	if request.method == "POST":
-		if "rerun" in request.POST:
-			print("rerun")
-			determineConfidence(confidence.puzzlePiece.id)
-			confidence = get_object_or_404(ConfidenceTracking, pk=confidence_id)
-
-	context = {
-		"confidence": confidence,
-	}
-	return render(request, 'collector/confidenceDetail.html', context)
-
-
-def determineConfidence(puzzlepieceId):
-	data = TranscriptionData.objects.filter(puzzlePiece_id=puzzlepieceId)
+def determine_confidence(puzzle_piece_id):
+	data = Transcription.objects.filter(puzzle_piece_id=puzzle_piece_id)
 
 	hashes = {}
-	confidenceRatio = 80
-	rotatedConfidenceRatio = 90
-	confidenceThreshold = 0 # We set this programmatically later
-	minSubmissions = 10
-	rotatedMinSubmissions = 15
-	badCount = 0
-	badThreshold = 4
-	rotationCount = 0
-	totalCount = len(data)
-	updateTransCount(puzzlepieceId,totalCount)
+	bad_count = 0
+	rotation_count = 0
 
-	# Track bad images
+	# Count transcriptions where the image had been marked as bad
 	for d in data:
 		if d.bad_image:
-			badCount += 1
-			continue
-
-	if badCount >= badThreshold:
-		setOrUpdateBadImage(puzzlepieceId, badCount)
+			bad_count += 1
+	# Stop calculation when BAD_FLAG_THRESHOLD is reached
+	if bad_count >= BAD_FLAG_THRESHOLD:
 		return
 
-	# Track rotated images
+	# Count transcription with reported image rotation
 	for d in data:
-		if d.orientation == "wrong":
-			rotationCount += 1
-			continue
-
-	if rotationCount > 0:
-		setOrUpdateRotatedImage(puzzlepieceId, rotationCount)
-
-	# Adjust totalCount, we will exclude bad Image submissions
-	for d in data:
-		if d.bad_image:
-			totalCount -= 1
-			continue
+		if d.rotation_flag:
+			rotation_count += 1
+	# Adjust valid_transcriptions, we will exclude bad image submissions from now on
+	valid_transcriptions = len(data) - bad_count
 
 	# Is there enough data to determine a confidence level?
 	# If no, create or update a tracker entry.
-	if not rotationCount and totalCount < minSubmissions:
-		tracker = setOrUpdateConfidenceTracking(puzzlepieceId, totalCount)
-		return
-	elif rotationCount and totalCount < rotatedMinSubmissions:
-		tracker = setOrUpdateConfidenceTracking(puzzlepieceId, totalCount)
+	if (rotation_count == 0 and valid_transcriptions < MIN_TRANSCRIPTIONS) or (rotation_count > 0 and valid_transcriptions < MIN_ROTATED_TRANSCRIPTIONS):
 		return
 
 	for d in data:
-		if d.datahash not in hashes:
-			hashes[d.datahash] = 0
-		hashes[d.datahash] = hashes[d.datahash] + 1
-	# solution confidence threshold is...
-	if not rotationCount:
-		confidenceThreshold = confidenceRatio
-	else:
-		confidenceThreshold = rotatedConfidenceRatio
+		if d.hash not in hashes:
+			hashes[d.hash] = 0
+		hashes[d.hash] += 1
 
-	biggest = 0
-	biggesthash = None
-	if hashes:
-		for hash, count in hashes.items():
-			if count > biggest:
-				biggest = count
-				biggesthash = hash
+	most_common_hash_count = 0
+	for _, count in hashes.items():
+		if count > most_common_hash_count:
+			most_common_hash_count = count
 
-		confidence = (biggest / totalCount) * 100
-		# Update the confidence...
-		tracker = setOrUpdateConfidenceTracking(puzzlepieceId, confidence)
+	confidence = (most_common_hash_count / valid_transcriptions) * 100
+	# Update the confidence on the puzzle piece
+	upsert_confidence(puzzle_piece_id, confidence)
 
-		if confidence >= confidenceThreshold:
-			# find the first transcription data object with the hash...
-			for d in data:
-				if d.datahash == biggesthash:
-					setOrUpdateConfidenceSolution(puzzlepieceId, confidence, d.id)
-					break
+def upsert_confidence(puzzle_piece_id, confidence):
+	puzzle_piece = get_object_or_404(PuzzlePiece, pk=puzzle_piece_id)
+	puzzle_piece.confidence = confidence
+	puzzle_piece.save()
 
-
-def updateTransCount(puzzlepieceId, transCount):
-	try:
-		piece = PuzzlePiece.objects.get(id=puzzlepieceId)
-		piece = PuzzlePiece.objects.filter(id=piece.id).update(transCount=transCount)
-		return piece
-	except Exception as ex:
-		piece = None
-
-def setOrUpdateBadImage(puzzlepieceId, badCount):
-	try:
-		bad = BadImage.objects.get(puzzlePiece_id=puzzlepieceId)
-		bad = BadImage.objects.filter(id=bad.id).update(badCount=badCount)
-		return bad
-	except Exception as ex:
-		bad = None
-
-	bad = BadImage()
-	bad.puzzlePiece = get_object_or_404(PuzzlePiece, pk=puzzlepieceId)
-	bad.badCount = badCount
-	bad.save()
-	return bad
-
-def setOrUpdateRotatedImage(puzzlepieceId, rotationCount):
-	try:
-		rotated = RotatedImage.objects.get(puzzlePiece_id=puzzlepieceId)
-		rotated = RotatedImage.objects.filter(id=rotated.id).update(rotatedCount=rotationCount)
-		return rotated
-	except Exception as ex:
-		rotated = None
-
-	rotated = RotatedImage()
-	rotated.puzzlePiece = get_object_or_404(PuzzlePiece, pk=puzzlepieceId)
-	rotated.rotatedCount = rotationCount
-	rotated.save()
-	return rotated
-
-def setOrUpdateConfidenceTracking(puzzlepieceId, confidence):
-	try:
-		tracker = ConfidenceTracking.objects.get(puzzlePiece_id=puzzlepieceId)
-		tracker = ConfidenceTracking.objects.filter(id=tracker.id).update(confidence=confidence)
-		return tracker
-	except Exception as ex:
-		tracker = None
-
-	tracker = ConfidenceTracking()
-	tracker.puzzlePiece = get_object_or_404(PuzzlePiece, pk=puzzlepieceId)
-	tracker.confidence = confidence
-	tracker.save()
-	return tracker
-
-def setOrUpdateConfidenceSolution(puzzlepieceId, confidence, transcriptiondataId):
-	try:
-		solution = ConfidentSolution.objects.get(puzzlePiece_id=puzzlepieceId)
-		solution = ConfidentSolution.objects.filter(id=solution.id).update(
-				confidence=confidence
-		)
-		return solution
-	except Exception as ex:
-		solution = None
-
-
-	solution = ConfidentSolution()
-
-	transcription = TranscriptionData.objects.get(id=transcriptiondataId)
-	print("looking for {} and found {}".format(transcriptiondataId, transcription.id))
-	solution.center = transcription.center
-	solution.wall1 = transcription.wall1
-	solution.wall2 = transcription.wall2
-	solution.wall3 = transcription.wall3
-	solution.wall4 = transcription.wall4
-	solution.wall5 = transcription.wall5
-	solution.wall6 = transcription.wall6
-
-	solution.link1 = transcription.link1
-	solution.link2 = transcription.link2
-	solution.link3 = transcription.link3
-	solution.link4 = transcription.link4
-	solution.link5 = transcription.link5
-	solution.link6 = transcription.link6
-
-	solution.datahash = transcription.datahash
-	solution.puzzlePiece = get_object_or_404(PuzzlePiece, pk=puzzlepieceId)
-
-	solution.confidence = confidence
-	solution.save()
-
-	return solution
-
-@method_decorator(cache_page(5 * 60), name='dispatch')
+@method_decorator(cache_page(60), name='dispatch')
 class ConfidenceSolutionIndex(generic.ListView):
-	model = ConfidentSolution
 	template_name = 'collector/confidenceSolutionIndex.html'
 	context_object_name = "collection"
 
-
-def confidenceSolutionDetail(request, solution_id):
-	solution = get_object_or_404(ConfidentSolution, pk=solution_id)
-
-	context = {
-		"solution": solution,
-	}
-	return render(request, 'collector/confidenceSolutionDetail.html', context)
+	def get_queryset(self):
+		return PuzzlePiece.objects.filter(confidence__gte=CONFIDENCE_RATIO)
 
 
 class PuzzlePieceViewSet(viewsets.ReadOnlyModelViewSet):
-    # annotate badimages count for serializer performance
-    queryset = PuzzlePiece.objects.all().annotate(
-        badimage_count=Max('badimages__badCount'),
-    )
-    serializer_class = PuzzlePieceSerializer
+	# annotate badimages count for serializer performance
+	queryset = PuzzlePiece.objects.all()
+	serializer_class = PuzzlePieceSerializer
 
-    @action(detail=False)
-    def get_random(self, request):
-        qs = PuzzlePiece.objects.annotate(
-            transcription_count=Count('transcriptions'),
-        ).filter(transcription_count__lt=5)
-        count = qs.aggregate(count=Count('pk'))['count']
-        print(count)
-        if count < 1:
-            return Response({}, status=status.HTTP_404_NOT_FOUND)
-        random_index = randint(0, count - 1)
-        rando = qs[random_index]
-        serializer = self.get_serializer(rando)
-        return Response(serializer.data)
+	@action(detail=False)
+	def get_random(self, request):
+		unconfident_piece = find_unconfident_puzzle_piece(request)
+		serializer = self.get_serializer(unconfident_piece)
+		return Response(serializer.data)
 
-    @action(detail=True, methods=['post'])
-    def report(self, request, *args, **kwargs):
-        piece = self.get_object()
-        if piece.badimages.count() > 0:
-            # atomic increment of the count on all existing BadImages
-            piece.badimages.update(badCount=F('badCount')+1)
-        else:
-            # create a BadImage... might have a race condition :(
-            bad = BadImage(puzzlePiece=piece, badCount=1)
-            bad.save()
-
-        # go ahead and return the updated piece
-        piece = self.get_object()
-        serializer = self.get_serializer(piece)
-        return Response(serializer.data)
-
-
-class TranscriptionDataViewSet(viewsets.GenericViewSet, mixins.CreateModelMixin):
-    queryset = TranscriptionData.objects.all()
+class TranscriptionViewSet(viewsets.GenericViewSet, mixins.CreateModelMixin):
+    queryset = Transcription.objects.all()
     serializer_class = TranscriptionDataSerializer
 
     # copied code from the mixin, but we need access to request here
@@ -621,19 +338,9 @@ class TranscriptionDataViewSet(viewsets.GenericViewSet, mixins.CreateModelMixin)
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            ip = x_forwarded_for.split(',')[0]
-        else:
-            ip = request.META.get('REMOTE_ADDR')
-
-        # TODO: ALSO MAKE HASH
-
-        # ip_address in kwargs here *should* put it in?
-        serializer.save(ip_address=ip)
-
+        client_identifier = disguise_client_ip(get_client_ip(request))
+        serializer.save(submitter=client_identifier)
         headers = self.get_success_headers(serializer.data)
-
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
 @cache_page(60 * 5)
@@ -685,7 +392,7 @@ def exportVerifiedCSV(request):
 
 	return response
 
-@cache_page(60 * 10)
+@cache_page(60 * 5)
 def exportPiecesCSV(request):
 	response = HttpResponse(content_type = 'text/csv')
 	response['Content-Disposition'] = 'attachment; filename="imgurls.csv"'
