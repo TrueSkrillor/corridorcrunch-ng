@@ -7,6 +7,21 @@
 </p>
 join us on discord!
 
+# And we're done
+It's been a blast, thank you to everyone who transcribed, you're the true GOATs!  
+Final csv export files are in this repo, in both rehashed and original format   
+
+ - We collected a total of 50885 transcriptions in just hours / days
+ - We got confident on 1453 puzzlepieces, 1096 of them being unique
+ - Our database on puzzlepieces to transcribe contains a total 26336 images
+ - The person with the most transcriptions transcribed 184 images
+ - Every person has transcribed an average count of 10.1543 images
+
+We're looking forward to the next community based puzzle - next time we'll kick that off even earlier
+
+You all ROCK!
+
+[The repo for the pretty pretty frontend](https://github.com/Corridors-of-Time-Transcription/corridorcrunch-frontend)
 # about
 > spreadsheetstiny 2: corridors of sleeplessness
 
@@ -113,71 +128,93 @@ python manage.py runserver 8000
 - [ ] update this readme lmao
 
 # Rough guide to spinning this up as a dev server from scratch. Is missing notes on lup (mount local dir) and general iteration loop
-Assuming a fresh Ubuntu 18.04 host
+Assuming a fresh Ubuntu 18.04 host. This also works in Win10 2004 with WSL2 docker and Docker for Desktop
 
 From the ~ directory, here assuming a non-root user
 
+```
 sudo apt update  
 sudo apt upgrade  
+```
 Restart services automatically and keep local versions when asked  
 
 Some of these upgrades require reboot, let's do that now  
-sudo reboot  
+```sudo reboot  
 
 sudo apt install direnv  
 sudo apt install docker  
 sudo apt install docker-compose  
 
 sudo usermod -aG docker $USER  
+```
 
 Create .vimrc  
+```
 vi .vimrc  
 set noexpandtab  
-:set background=dark  
+set background=dark  
+```
 
 Add to the very end of .bashrc  
+```
 vi .bashrc  
 eval "$(direnv hook bash)"  
 LS_COLORS=$LS_COLORS:'di=1;44:' ; export LS_COLORS  
+```
 
 Log out and back in  
 
 Minimal git setup  
-git config --global user.name "<Your name>"  
-git config --global user.email <Your email>  
+```
+git config --global user.name "*Your name*"  
+git config --global user.email *Your email*  
 git config --global core.autocrlf input  
+```
 
 If you just want to play with it and you don't intend to submit code:  
+```
 git clone git@github.com:Corridors-of-Time-Transcription/puzzlepieces.git  
+```
 
 If you DO want to submit code and PRs, please:  
 - Fork to your own repo  
-- On your dev server, create keys  
-ssh-keygen -o -b 4096 -t rsa   
-cat .ssh/id_rsa.pub  
+- On your dev server, create keys
+```
+ssh-keygen -t ed25519 -o
+cat .ssh/id_ed25519.pub
+```
 
 Go to your github settings, SSH and GPG keys, and set this as a "New SSH key". Title could be "Puzzle Test Server" or something descriptive.  
 
-Get the URL for this from your github fork, "Clone with SSH", and  
-git clone <URL github gave you>  
+Get the URL for the develop branch (NOT master) from your github fork, "Clone with SSH", and  
+```
+git clone *URL github gave you*  
 cd puzzlepieces  
 git remote add upstream git@github.com:Corridors-of-Time-Transcription/puzzlepieces.git  
 git remote -v  
+```
 
-cd puzzlepieces  
+Once you have the code from either git:
+```
+cd ~/puzzlepieces 
 direnv allow  
+```
 
 Now edit docker files depending on how you'll access your machine. Yes we know our docker routing is shonky. We invite help! Get in touch with @ebuch.  
 
 So, figure out how you access your dev server. If it's through localhost, no changes needed. If it's through another IP or a name, you'll need that IP or that name, and we'll tell docker about it. Notably that's what you use to get to it, which may not be its local IP.  
 
+```
 cd ops  
 vi docker-compose.dev.yml  
-Find "VIRTUAL_HOST=localhost" and change to "VIRTUAL_HOST=<whatever-IP-or-name-you-use-to-connect>"  
+```
+
+Find "VIRTUAL_HOST=localhost" and change to "VIRTUAL_HOST=*whatever-IP-or-name-you-use-to-connect*"  
 
 Rinse repeat for docker-compose.dev.local.yml  
 
 Environment files next. Same thing here, docker help appreciated  
+```
 cp db-dev.env.example db-dev.env  
 cp production.env.example production.env  
 cp development.env.example development.env  
@@ -185,24 +222,52 @@ cp development.env.example development.env
 cd ..  
 git update-index --assume-unchanged ops/docker-compose.dev.local.yml  
 git update-index --assume-unchanged ops/docker-compose.dev.yml  
+```
 
 Back to puzzlepieces and spin this up. We're using pz, which is just a little script wrapped around docker  
 
+```
 pz build  
 pz up  
+```
 
-You should be able to get to http://<your-machine> and docker ps should show you three containers  
+You should be able to get to http://*your-machine*, and from CLI  ```docker ps``` should show you three containers  
 
-Syncing with upstream master, assuming your own fork and a fork and branch model  
-git checkout master  
-git pull upstream master  
+Syncing with upstream master, assuming your own fork and a fork and branch model 
+
+```
+git checkout develop
+git pull upstream develop 
 git push  
+```
 
-And get the changes into your environment  
+And get the changes into your running docker instances  
 
-pz down  
+```
 pz build  
-pz up  
+pz up
+```
 
-The DB is named "puzzlepieces", the user is "puzzler" and the password "puzzling"  
+Similar for "master" which is where the live version was going to live.
+
+
+If you have PRs to contribute, not that we do this now any more, it'd be:
+
+```
+git checkout develop
+git checkout -b *new-feature-branch*
+```
+
+Lots of coding occurs, testing, etc
+
+```
+git commit
+git checkout develop
+git pull upstream develop
+git checkout *new-feature-branch*
+git rebase develop
+git push --set-upstream origin *new-feature-branch*
+```
+
+The DB for the dev environment is named "puzzlepieces", the user is "puzzler" and the password "puzzling"  
 
